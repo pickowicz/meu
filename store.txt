@@ -1,0 +1,890 @@
+USE [master]
+GO
+/****** Object:  StoredProcedure [dbo].[sp_Index]     ******/
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER ON
+GO
+
+ALTER PROCEDURE [dbo].[sp_Index]
+    @DatabaseName NVARCHAR(128) = NULL, /*Defaults to current DB if not specified*/
+    @SchemaName NVARCHAR(128) = NULL, /*Requires table_name as well.*/
+    @TableName NVARCHAR(128) = NULL,  /*Requires schema_name as well.*/
+    @Mode TINYINT=0, /*0=Diagnose, 1=Summarize, 2=Index Usage Detail, 3=Missing Index Detail, 4=Diagnose Details*/
+        /*Note:@Mode doesn't matter if you're specifying schema_name and @TableName.*/
+    @Filter TINYINT = 0, /* 0=no filter (default). 1=No low-usage warnings for objects with 0 reads. 2=Only warn for objects >= 500MB */
+        /*Note:@Filter doesn't do anything unless @Mode=0*/
+    @SkipPartitions BIT = 0,
+    @SkipStatistics BIT = 1,
+    @GetAllDatabases BIT = 0,
+      @ShowColumnstoreOnly BIT = 0, /* Will show only the Row Group and Segment details for a table with a columnstore index. */
+    @BringThePain BIT = 0,
+    @IgnoreDatabases NVARCHAR(MAX) = NULL, /* Comma-delimited list of databases you want to skip */
+    @ThresholdMB INT = 250 /* Number of megabytes that an object must be before we include it in basic results */,
+      @OutputType VARCHAR(20) = 'TABLE' ,
+    @OutputServerName NVARCHAR(256) = NULL ,
+    @OutputDatabaseName NVARCHAR(256) = NULL ,
+    @OutputSchemaName NVARCHAR(256) = NULL ,
+    @OutputTableName NVARCHAR(256) = NULL ,
+      @IncludeInactiveIndexes BIT = 0 /* Will skip indexes with no reads or writes */,
+    @ShowAllMissingIndexRequests BIT = 0 /*Will make all missing index requests show up*/,
+      @ShowPartitionRanges BIT = 0 /* Will add partition range values column to columnstore visualization */,
+      @SortOrder NVARCHAR(50) = NULL, /* Only affects @Mode = 2. */
+      @SortDirection NVARCHAR(4) = 'DESC', /* Only affects @Mode = 2. */
+    @Help TINYINT = 0,
+      @Debug BIT = 0,
+    @Version     VARCHAR(30) = NULL OUTPUT,
+      @VersionDate DATETIME = NULL OUTPUT,
+    @VersionCheckMode BIT = 0
+WITH RECOMPILE
+AS
+SET NOCOUNT ON;
+SET STATISTICS XML OFF;
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
+
+BEGIN
+      RETURN;
+END;
+
+IF @Help = 1
+BEGIN
+
+RETURN;
+END;    /* @Help = 1 */
+
+DECLARE @ScriptVersionName NVARCHAR(50);
+DECLARE @DaysUptime NUMERIC(23,2);
+DECLARE @DatabaseID INT;
+DECLARE @ObjectID INT;
+DECLARE @dsql NVARCHAR(MAX);
+DECLARE @params NVARCHAR(MAX);
+DECLARE @msg NVARCHAR(4000);
+DECLARE @ErrorSeverity INT;
+DECLARE @ErrorState INT;
+DECLARE @Rowcount BIGINT;
+DECLARE @SQLServerProductVersion NVARCHAR(128);
+DECLARE @SQLServerEdition INT;
+DECLARE @FilterMB INT;
+DECLARE @collation NVARCHAR(256);
+DECLARE @NumDatabases INT;
+DECLARE @LineFeed NVARCHAR(5);
+DECLARE @DaysUptimeInsertValue NVARCHAR(256);
+DECLARE @DatabaseToIgnore NVARCHAR(MAX);
+DECLARE @ColumnList NVARCHAR(MAX);
+DECLARE @PartitionCount INT;
+
+/* Let's get @SortOrder set to lower case here for comparisons later */
+SET @SortOrder = REPLACE(LOWER(@SortOrder), N' ', N'_');
+SET @SortDirection = LOWER(@SortDirection);
+
+SET @LineFeed = CHAR(13) + CHAR(10);
+SELECT @SQLServerProductVersion = CAST(SERVERPROPERTY('ProductVersion') AS NVARCHAR(128));
+SELECT @SQLServerEdition =CAST(SERVERPROPERTY('EngineEdition') AS INT); /* We default to online index creates where EngineEdition=3*/
+SET @FilterMB=250;
+--SELECT @ScriptVersionName = 'sp_Index(TM) v' + @Version + ' - ' + DATENAME(MM, @VersionDate) + ' ' + RIGHT('0'+DATENAME(DD, @VersionDate),2) + ', ' + DATENAME(YY, @VersionDate);
+SET @IgnoreDatabases = REPLACE(REPLACE(LTRIM(RTRIM(@IgnoreDatabases)), CHAR(10), ''), CHAR(13), '');
+
+RAISERROR(N'Starting run. %s', 0,1, @ScriptVersionName) WITH NOWAIT;
+                                                                                                                              
+IF(@OutputType NOT IN ('TABLE','NONE'))
+BEGIN
+    RAISERROR('Invalid value for parameter @OutputType. Expected: (TABLE;NONE)',12,1);
+    RETURN;
+END;
+                       
+IF(@OutputType = 'NONE')
+BEGIN
+    IF(@OutputTableName IS NULL OR @OutputSchemaName IS NULL OR @OutputDatabaseName IS NULL)
+    BEGIN
+        RAISERROR('This procedure should be called with a value for @Output* parameters, as @OutputType is set to NONE',12,1);
+        RETURN;
+    END;
+    IF(@BringThePain = 1)
+    BEGIN
+        RAISERROR('Incompatible Parameters: @BringThePain set to 1 and @OutputType set to NONE',12,1);
+        RETURN;
+    END;
+      /* Eventually limit by mode                                                                                                                 
+    IF(@Mode not in (0,4))
+      BEGIN
+        RAISERROR('Incompatible Parameters: @Mode set to %d and @OutputType set to NONE',12,1,@Mode);
+        RETURN;
+      END;
+      */
+END;
+
+IF OBJECT_ID('tempdb..#IndexSanity') IS NOT NULL
+    DROP TABLE #IndexSanity;
+
+IF OBJECT_ID('tempdb..#IndexPartitionSanity') IS NOT NULL
+    DROP TABLE #IndexPartitionSanity;
+
+IF OBJECT_ID('tempdb..#IndexSanitySize') IS NOT NULL
+    DROP TABLE #IndexSanitySize;
+
+IF OBJECT_ID('tempdb..#IndexColumns') IS NOT NULL
+    DROP TABLE #IndexColumns;
+
+IF OBJECT_ID('tempdb..#MissingIndexes') IS NOT NULL
+    DROP TABLE #MissingIndexes;
+
+IF OBJECT_ID('tempdb..#ForeignKeys') IS NOT NULL
+    DROP TABLE #ForeignKeys;
+
+IF OBJECT_ID('tempdb..#IndexResults') IS NOT NULL
+    DROP TABLE #IndexResults;
+       
+IF OBJECT_ID('tempdb..#IndexCreateTsql') IS NOT NULL    
+    DROP TABLE #IndexCreateTsql;
+
+IF OBJECT_ID('tempdb..#DatabaseList') IS NOT NULL
+    DROP TABLE #DatabaseList;
+
+IF OBJECT_ID('tempdb..#Statistics') IS NOT NULL
+    DROP TABLE #Statistics;
+
+IF OBJECT_ID('tempdb..#PartitionCompressionInfo') IS NOT NULL
+    DROP TABLE #PartitionCompressionInfo;
+
+IF OBJECT_ID('tempdb..#ComputedColumns') IS NOT NULL
+    DROP TABLE #ComputedColumns;
+      
+IF OBJECT_ID('tempdb..#TraceStatus') IS NOT NULL
+      DROP TABLE #TraceStatus;
+
+IF OBJECT_ID('tempdb..#TemporalTables') IS NOT NULL
+      DROP TABLE #TemporalTables;
+
+IF OBJECT_ID('tempdb..#CheckConstraints') IS NOT NULL
+      DROP TABLE #CheckConstraints;
+
+IF OBJECT_ID('tempdb..#FilteredIndexes') IS NOT NULL
+      DROP TABLE #FilteredIndexes;
+            
+IF OBJECT_ID('tempdb..#Ignore_Databases') IS NOT NULL
+    DROP TABLE #Ignore_Databases
+
+
+
+
+        RAISERROR (N'Create temp tables.',0,1) WITH NOWAIT;
+        CREATE TABLE #IndexResults
+            (
+              _result_id INT IDENTITY PRIMARY KEY,
+              check_id INT NOT NULL,
+              index_sanity_id INT NULL,
+              Priority INT NULL,
+              findings_group NVARCHAR(4000)  NULL,
+              finding NVARCHAR(200) NOT NULL,
+              [database_name] NVARCHAR(128) NULL,
+              URL NVARCHAR(200) NOT NULL,
+              details NVARCHAR(MAX) NOT NULL,
+              index_definition NVARCHAR(MAX) NOT NULL,
+              secret_columns NVARCHAR(MAX) NULL,
+              index_usage_summary NVARCHAR(MAX) NULL,
+              index_size_summary NVARCHAR(MAX) NULL,
+              create_tsql NVARCHAR(MAX) NULL,
+              more_info NVARCHAR(MAX)NULL
+            );
+
+        CREATE TABLE #IndexSanity
+            (
+              [index_sanity_id] INT IDENTITY PRIMARY KEY CLUSTERED,
+              [database_id] SMALLINT NOT NULL ,
+              [object_id] INT NOT NULL ,
+              [index_id] INT NOT NULL ,
+              [index_type] TINYINT NOT NULL,
+              [database_name] NVARCHAR(128) NOT NULL ,
+              [schema_name] NVARCHAR(128) NOT NULL ,
+              [object_name] NVARCHAR(128) NOT NULL ,
+              index_name NVARCHAR(128) NULL ,
+              key_column_names NVARCHAR(MAX) NULL ,
+              key_column_names_with_sort_order NVARCHAR(MAX) NULL ,
+              key_column_names_with_sort_order_no_types NVARCHAR(MAX) NULL ,
+              count_key_columns INT NULL ,
+              include_column_names NVARCHAR(MAX) NULL ,
+              include_column_names_no_types NVARCHAR(MAX) NULL ,
+              count_included_columns INT NULL ,
+              partition_key_column_name NVARCHAR(MAX) NULL,
+              filter_definition NVARCHAR(MAX) NOT NULL ,
+              is_indexed_view BIT NOT NULL ,
+              is_unique BIT NOT NULL ,
+              is_primary_key BIT NOT NULL ,
+              is_XML BIT NOT NULL,
+              is_spatial BIT NOT NULL,
+              is_NC_columnstore BIT NOT NULL,
+              is_CX_columnstore BIT NOT NULL,
+              is_in_memory_oltp BIT NOT NULL ,
+              is_disabled BIT NOT NULL ,
+              is_hypothetical BIT NOT NULL ,
+              is_padded BIT NOT NULL ,
+              fill_factor SMALLINT NOT NULL ,
+              user_seeks BIGINT NOT NULL ,
+              user_scans BIGINT NOT NULL ,
+              user_lookups BIGINT NOT  NULL ,
+              user_updates BIGINT NULL ,
+              last_user_seek DATETIME NULL ,
+              last_user_scan DATETIME NULL ,
+              last_user_lookup DATETIME NULL ,
+              last_user_update DATETIME NULL ,
+              is_referenced_by_foreign_key BIT DEFAULT(0),
+              secret_columns NVARCHAR(MAX) NULL,
+              count_secret_columns INT NULL,
+              create_date DATETIME NOT NULL,
+              modify_date DATETIME NOT NULL,
+              filter_columns_not_in_index NVARCHAR(MAX),
+            [db_schema_object_name] AS [schema_name] + N'.' + [object_name]  ,
+            [db_schema_object_indexid] AS [schema_name] + N'.' + [object_name]
+                + CASE WHEN [index_name] IS NOT NULL THEN N'.' + index_name
+                ELSE N''
+                END + N' (' + CAST(index_id AS NVARCHAR(20)) + N')' ,
+            first_key_column_name AS CASE    WHEN count_key_columns > 1
+                THEN LEFT(key_column_names, CHARINDEX(',', key_column_names, 0) - 1)
+                ELSE key_column_names
+                END ,
+            index_definition AS
+            CASE WHEN partition_key_column_name IS NOT NULL
+                THEN N'[PARTITIONED BY:' + partition_key_column_name +  N']'
+                ELSE ''
+                END +
+                CASE index_id
+                    WHEN 0 THEN N'[HEAP] '
+                    WHEN 1 THEN N'[CX] '
+                    ELSE N'' END + CASE WHEN is_indexed_view = 1 THEN N'[VIEW] '
+                    ELSE N'' END + CASE WHEN is_primary_key = 1 THEN N'[PK] '
+                    ELSE N'' END + CASE WHEN is_XML = 1 THEN N'[XML] '
+                    ELSE N'' END + CASE WHEN is_spatial = 1 THEN N'[SPATIAL] '
+                    ELSE N'' END + CASE WHEN is_NC_columnstore = 1 THEN N'[COLUMNSTORE] '
+                    ELSE N'' END + CASE WHEN is_in_memory_oltp = 1 THEN N'[IN-MEMORY] '
+                    ELSE N'' END + CASE WHEN is_disabled = 1 THEN N'[DISABLED] '
+                    ELSE N'' END + CASE WHEN is_hypothetical = 1 THEN N'[HYPOTHETICAL] '
+                    ELSE N'' END + CASE WHEN is_unique = 1 AND is_primary_key = 0 THEN N'[UNIQUE] '
+                    ELSE N'' END + CASE WHEN count_key_columns > 0 THEN
+                        N'[' + CAST(count_key_columns AS NVARCHAR(10)) + N' KEY'
+                            + CASE WHEN count_key_columns > 1 THEN  N'S' ELSE N'' END
+                            + N'] ' + LTRIM(key_column_names_with_sort_order)
+                    ELSE N'' END + CASE WHEN count_included_columns > 0 THEN
+                        N' [' + CAST(count_included_columns AS NVARCHAR(10))  + N' INCLUDE' +
+                            + CASE WHEN count_included_columns > 1 THEN  N'S' ELSE N'' END                    
+                            + N'] ' + include_column_names
+                    ELSE N'' END + CASE WHEN filter_definition <> N'' THEN N' [FILTER] ' + filter_definition
+                    ELSE N'' END ,
+            [total_reads] AS user_seeks + user_scans + user_lookups,
+            [reads_per_write] AS CAST(CASE WHEN user_updates > 0
+                THEN ( user_seeks + user_scans + user_lookups )  / (1.0 * user_updates)
+                ELSE 0 END AS MONEY) ,
+            [index_usage_summary] AS
+                        CASE WHEN is_spatial = 1 THEN N'Not Tracked'
+                        WHEN is_disabled = 1 THEN N'Disabled'
+                        ELSE N'Reads: ' +
+                              REPLACE(CONVERT(NVARCHAR(30),CAST((user_seeks + user_scans + user_lookups) AS MONEY), 1), N'.00', N'')
+                              + CASE WHEN user_seeks + user_scans + user_lookups > 0 THEN
+                                    N' ('
+                                          + RTRIM(
+                                          CASE WHEN user_seeks > 0 THEN REPLACE(CONVERT(NVARCHAR(30),CAST((user_seeks) AS MONEY), 1), N'.00', N'') + N' seek ' ELSE N'' END
+                                          + CASE WHEN user_scans > 0 THEN REPLACE(CONVERT(NVARCHAR(30),CAST((user_scans) AS MONEY), 1), N'.00', N'') + N' scan '  ELSE N'' END
+                                          + CASE WHEN user_lookups > 0 THEN  REPLACE(CONVERT(NVARCHAR(30),CAST((user_lookups) AS MONEY), 1), N'.00', N'') + N' lookup' ELSE N'' END
+                                          )
+                                          + N') '
+                                    ELSE N' '
+                                    END
+                              + N'Writes: ' +
+                              REPLACE(CONVERT(NVARCHAR(30),CAST(user_updates AS MONEY), 1), N'.00', N'')
+                        END /* First "end" is about is_spatial */,
+                        [more_info] AS
+                        CASE WHEN is_in_memory_oltp = 1
+                              THEN N'EXEC dbo.sp_InMemoryOLTP @dbName=' + QUOTENAME([database_name],N'''') +
+                              N', @tableName=' + QUOTENAME([object_name],N'''') + N';'
+                        ELSE N'EXEC dbo.sp_Index @DatabaseName=' + QUOTENAME([database_name],N'''') +
+                              N', @SchemaName=' + QUOTENAME([schema_name],N'''') + N', @TableName=' + QUOTENAME([object_name],N'''') + N';'
+                        END
+            );
+        RAISERROR (N'Adding UQ index on #IndexSanity (database_id, object_id, index_id)',0,1) WITH NOWAIT;
+        IF NOT EXISTS(SELECT 1 FROM tempdb.sys.indexes WHERE name='uq_database_id_object_id_index_id')
+            CREATE UNIQUE INDEX uq_database_id_object_id_index_id ON #IndexSanity (database_id, object_id, index_id);
+
+
+
+
+
+
+
+
+        CREATE TABLE #IndexPartitionSanity
+            (
+              [index_partition_sanity_id] INT IDENTITY,
+              [index_sanity_id] INT NULL ,
+              [database_id] INT NOT NULL ,
+              [object_id] INT NOT NULL ,
+                    [schema_name] NVARCHAR(128) NOT NULL,
+              [index_id] INT NOT NULL ,
+              [partition_number] INT NOT NULL ,
+              row_count BIGINT NOT NULL ,
+              reserved_MB NUMERIC(29,2) NOT NULL ,
+              reserved_LOB_MB NUMERIC(29,2) NOT NULL ,
+              reserved_row_overflow_MB NUMERIC(29,2) NOT NULL ,
+              reserved_dictionary_MB NUMERIC(29,2) NOT NULL ,
+              leaf_insert_count BIGINT NULL ,
+              leaf_delete_count BIGINT NULL ,
+              leaf_update_count BIGINT NULL ,
+              range_scan_count BIGINT NULL ,
+              singleton_lookup_count BIGINT NULL ,
+              forwarded_fetch_count BIGINT NULL ,
+              lob_fetch_in_pages BIGINT NULL ,
+              lob_fetch_in_bytes BIGINT NULL ,
+              row_overflow_fetch_in_pages BIGINT NULL ,
+              row_overflow_fetch_in_bytes BIGINT NULL ,
+              row_lock_count BIGINT NULL ,
+              row_lock_wait_count BIGINT NULL ,
+              row_lock_wait_in_ms BIGINT NULL ,
+              page_lock_count BIGINT NULL ,
+              page_lock_wait_count BIGINT NULL ,
+              page_lock_wait_in_ms BIGINT NULL ,
+              index_lock_promotion_attempt_count BIGINT NULL ,
+              index_lock_promotion_count BIGINT NULL,
+              data_compression_desc NVARCHAR(60) NULL,
+                    page_latch_wait_count BIGINT NULL,
+                    page_latch_wait_in_ms BIGINT NULL,
+                    page_io_latch_wait_count BIGINT NULL,
+                    page_io_latch_wait_in_ms BIGINT NULL,
+              lock_escalation_desc nvarchar(60) NULL
+            );
+
+        CREATE TABLE #IndexSanitySize
+            (
+              [index_sanity_size_id] INT IDENTITY NOT NULL ,
+              [index_sanity_id] INT NULL ,
+              [database_id] INT NOT NULL,
+                    [schema_name] NVARCHAR(128) NOT NULL,
+              partition_count INT NOT NULL ,
+              total_rows BIGINT NOT NULL ,
+              total_reserved_MB NUMERIC(29,2) NOT NULL ,
+              total_reserved_LOB_MB NUMERIC(29,2) NOT NULL ,
+              total_reserved_row_overflow_MB NUMERIC(29,2) NOT NULL ,
+              total_reserved_dictionary_MB NUMERIC(29,2) NOT NULL ,
+              total_leaf_delete_count BIGINT NULL,
+              total_leaf_update_count BIGINT NULL,
+              total_range_scan_count BIGINT NULL,
+              total_singleton_lookup_count BIGINT NULL,
+              total_forwarded_fetch_count BIGINT NULL,
+              total_row_lock_count BIGINT NULL ,
+              total_row_lock_wait_count BIGINT NULL ,
+              total_row_lock_wait_in_ms BIGINT NULL ,
+              avg_row_lock_wait_in_ms BIGINT NULL ,
+              total_page_lock_count BIGINT NULL ,
+              total_page_lock_wait_count BIGINT NULL ,
+              total_page_lock_wait_in_ms BIGINT NULL ,
+              avg_page_lock_wait_in_ms BIGINT NULL ,
+               total_index_lock_promotion_attempt_count BIGINT NULL ,
+              total_index_lock_promotion_count BIGINT NULL ,
+              data_compression_desc NVARCHAR(4000) NULL,
+                    page_latch_wait_count BIGINT NULL,
+                    page_latch_wait_in_ms BIGINT NULL,
+                    page_io_latch_wait_count BIGINT NULL,
+                    page_io_latch_wait_in_ms BIGINT NULL,
+              lock_escalation_desc nvarchar(60) NULL,
+              index_size_summary AS ISNULL(
+                CASE WHEN partition_count > 1
+                        THEN N'[' + CAST(partition_count AS NVARCHAR(10)) + N' PARTITIONS] '
+                        ELSE N''
+                END + REPLACE(CONVERT(NVARCHAR(30),CAST([total_rows] AS MONEY), 1), N'.00', N'') + N' rows; '
+                + CASE WHEN total_reserved_MB > 1024 THEN
+                    CAST(CAST(total_reserved_MB/1024. AS NUMERIC(29,1)) AS NVARCHAR(30)) + N'GB'
+                ELSE
+                    CAST(CAST(total_reserved_MB AS NUMERIC(29,1)) AS NVARCHAR(30)) + N'MB'
+                END
+                + CASE WHEN total_reserved_LOB_MB > 1024 THEN
+                    N'; ' + CAST(CAST(total_reserved_LOB_MB/1024. AS NUMERIC(29,1)) AS NVARCHAR(30)) + N'GB ' + CASE WHEN total_reserved_dictionary_MB = 0 THEN N'LOB' ELSE N'Columnstore' END
+                WHEN total_reserved_LOB_MB > 0 THEN
+                    N'; ' + CAST(CAST(total_reserved_LOB_MB AS NUMERIC(29,1)) AS NVARCHAR(30)) + N'MB ' + CASE WHEN total_reserved_dictionary_MB = 0 THEN N'LOB' ELSE N'Columnstore' END
+                ELSE ''
+                END
+                 + CASE WHEN total_reserved_row_overflow_MB > 1024 THEN
+                    N'; ' + CAST(CAST(total_reserved_row_overflow_MB/1024. AS NUMERIC(29,1)) AS NVARCHAR(30)) + N'GB Row Overflow'
+                WHEN total_reserved_row_overflow_MB > 0 THEN
+                    N'; ' + CAST(CAST(total_reserved_row_overflow_MB AS NUMERIC(29,1)) AS NVARCHAR(30)) + N'MB Row Overflow'
+                ELSE ''
+                END
+                 + CASE WHEN total_reserved_dictionary_MB > 1024 THEN
+                    N'; ' + CAST(CAST(total_reserved_dictionary_MB/1024. AS NUMERIC(29,1)) AS NVARCHAR(30)) + N'GB Dictionaries'
+                WHEN total_reserved_dictionary_MB > 0 THEN
+                    N'; ' + CAST(CAST(total_reserved_dictionary_MB AS NUMERIC(29,1)) AS NVARCHAR(30)) + N'MB Dictionaries'
+                ELSE ''
+                END ,
+                    N'Error- NULL in computed column'),
+            index_op_stats AS ISNULL(
+                (
+                    REPLACE(CONVERT(NVARCHAR(30),CAST(total_singleton_lookup_count AS MONEY), 1),N'.00',N'') + N' singleton lookups; '
+                    + REPLACE(CONVERT(NVARCHAR(30),CAST(total_range_scan_count AS MONEY), 1),N'.00',N'') + N' scans/seeks; '
+                    + REPLACE(CONVERT(NVARCHAR(30),CAST(total_leaf_delete_count AS MONEY), 1),N'.00',N'') + N' deletes; '
+                    + REPLACE(CONVERT(NVARCHAR(30),CAST(total_leaf_update_count AS MONEY), 1),N'.00',N'') + N' updates; '
+                    + CASE WHEN ISNULL(total_forwarded_fetch_count,0) >0 THEN
+                        REPLACE(CONVERT(NVARCHAR(30),CAST(total_forwarded_fetch_count AS MONEY), 1),N'.00',N'') + N' forward records fetched; '
+                    ELSE N'' END
+
+                    /* rows will only be in this dmv when data is in memory for the table */
+                ), N'Table metadata not in memory'),
+            index_lock_wait_summary AS ISNULL(
+                CASE WHEN total_row_lock_wait_count = 0 AND  total_page_lock_wait_count = 0 AND
+                    total_index_lock_promotion_attempt_count = 0 THEN N'0 lock waits; '
+                    + CASE WHEN lock_escalation_desc = N'DISABLE' THEN N'Lock escalation DISABLE.'
+                      ELSE N''
+                      END
+                ELSE
+                    CASE WHEN total_row_lock_wait_count > 0 THEN
+                        N'Row lock waits: ' + REPLACE(CONVERT(NVARCHAR(30),CAST(total_row_lock_wait_count AS MONEY), 1), N'.00', N'')
+                        + N'; total duration: ' +
+                            CASE WHEN total_row_lock_wait_in_ms >= 60000 THEN /*More than 1 min*/
+                                REPLACE(CONVERT(NVARCHAR(30),CAST((total_row_lock_wait_in_ms/60000) AS MONEY), 1), N'.00', N'') + N' minutes; '
+                            ELSE                        
+                                REPLACE(CONVERT(NVARCHAR(30),CAST(ISNULL(total_row_lock_wait_in_ms/1000,0) AS MONEY), 1), N'.00', N'') + N' seconds; '
+                            END
+                        + N'avg duration: ' +
+                            CASE WHEN avg_row_lock_wait_in_ms >= 60000 THEN /*More than 1 min*/
+                                REPLACE(CONVERT(NVARCHAR(30),CAST((avg_row_lock_wait_in_ms/60000) AS MONEY), 1), N'.00', N'') + N' minutes; '
+                            ELSE                        
+                                REPLACE(CONVERT(NVARCHAR(30),CAST(ISNULL(avg_row_lock_wait_in_ms/1000,0) AS MONEY), 1), N'.00', N'') + N' seconds; '
+                            END
+                    ELSE N''
+                    END +
+                    CASE WHEN total_page_lock_wait_count > 0 THEN
+                        N'Page lock waits: ' + REPLACE(CONVERT(NVARCHAR(30),CAST(total_page_lock_wait_count AS MONEY), 1), N'.00', N'')
+                        + N'; total duration: ' +
+                            CASE WHEN total_page_lock_wait_in_ms >= 60000 THEN /*More than 1 min*/
+                                REPLACE(CONVERT(NVARCHAR(30),CAST((total_page_lock_wait_in_ms/60000) AS MONEY), 1), N'.00', N'') + N' minutes; '
+                            ELSE                        
+                                REPLACE(CONVERT(NVARCHAR(30),CAST(ISNULL(total_page_lock_wait_in_ms/1000,0) AS MONEY), 1), N'.00', N'') + N' seconds; '
+                            END
+                        + N'avg duration: ' +
+                            CASE WHEN avg_page_lock_wait_in_ms >= 60000 THEN /*More than 1 min*/
+                                REPLACE(CONVERT(NVARCHAR(30),CAST((avg_page_lock_wait_in_ms/60000) AS MONEY), 1), N'.00', N'') + N' minutes; '
+                            ELSE                        
+                                REPLACE(CONVERT(NVARCHAR(30),CAST(ISNULL(avg_page_lock_wait_in_ms/1000,0) AS MONEY), 1), N'.00', N'') + N' seconds; '
+                            END
+                    ELSE N''
+                    END +
+                    CASE WHEN total_index_lock_promotion_attempt_count > 0 THEN
+                        N'Lock escalation attempts: ' + REPLACE(CONVERT(NVARCHAR(30),CAST(total_index_lock_promotion_attempt_count AS MONEY), 1), N'.00', N'')
+                        + N'; Actual Escalations: ' + REPLACE(CONVERT(NVARCHAR(30),CAST(ISNULL(total_index_lock_promotion_count,0) AS MONEY), 1), N'.00', N'') +N'; '
+                    ELSE N''
+                    END +
+                    CASE WHEN lock_escalation_desc = N'DISABLE' THEN
+                        N'Lock escalation is disabled.'
+                    ELSE N''
+                    END
+                END                  
+                    ,'Error- NULL in computed column')
+            );
+
+
+
+
+
+
+        CREATE TABLE #IndexColumns
+            (
+              [database_id] INT NOT NULL,
+                    [schema_name] NVARCHAR(128),
+              [object_id] INT NOT NULL ,
+              [index_id] INT NOT NULL ,
+              [key_ordinal] INT NULL ,
+              is_included_column BIT NULL ,
+              is_descending_key BIT NULL ,
+              [partition_ordinal] INT NULL ,
+              column_name NVARCHAR(256) NOT NULL ,
+              system_type_name NVARCHAR(256) NOT NULL,
+              max_length SMALLINT NOT NULL,
+              [precision] TINYINT NOT NULL,
+              [scale] TINYINT NOT NULL,
+              collation_name NVARCHAR(256) NULL,
+              is_nullable BIT NULL,
+              is_identity BIT NULL,
+              is_computed BIT NULL,
+              is_replicated BIT NULL,
+              is_sparse BIT NULL,
+              is_filestream BIT NULL,
+              seed_value DECIMAL(38,0) NULL,
+              increment_value DECIMAL(38,0) NULL ,
+              last_value DECIMAL(38,0) NULL,
+              is_not_for_replication BIT NULL
+            );
+        CREATE CLUSTERED INDEX CLIX_database_id_object_id_index_id ON #IndexColumns
+            (database_id, object_id, index_id);
+
+
+
+
+
+        CREATE TABLE #MissingIndexes
+            ([database_id] INT NOT NULL,
+                  [object_id] INT NOT NULL,
+            [database_name] NVARCHAR(128) NOT NULL ,
+            [schema_name] NVARCHAR(128) NOT NULL ,
+            [table_name] NVARCHAR(128),
+            [statement] NVARCHAR(512) NOT NULL,
+            magic_benefit_number AS (( user_seeks + user_scans ) * avg_total_user_cost * avg_user_impact),
+            avg_total_user_cost NUMERIC(29,4) NOT NULL,
+            avg_user_impact NUMERIC(29,1) NOT NULL,
+            user_seeks BIGINT NOT NULL,
+            user_scans BIGINT NOT NULL,
+            unique_compiles BIGINT NULL,
+            equality_columns NVARCHAR(MAX),
+            equality_columns_with_data_type NVARCHAR(MAX),
+            inequality_columns NVARCHAR(MAX),
+            inequality_columns_with_data_type NVARCHAR(MAX),
+            included_columns NVARCHAR(MAX),
+            included_columns_with_data_type NVARCHAR(MAX),
+                  is_low BIT,
+                [index_estimated_impact] AS
+                    REPLACE(CONVERT(NVARCHAR(256),CAST(CAST(
+                                    (user_seeks + user_scans)
+                                     AS BIGINT) AS MONEY), 1), '.00', '') + N' use'
+                        + CASE WHEN (user_seeks + user_scans) > 1 THEN N's' ELSE N'' END
+                         +N'; Impact: ' + CAST(avg_user_impact AS NVARCHAR(30))
+                        + N'%; Avg query cost: '
+                        + CAST(avg_total_user_cost AS NVARCHAR(30)),
+                [missing_index_details] AS
+                    CASE WHEN COALESCE(equality_columns_with_data_type,equality_columns) IS NOT NULL
+                                    THEN N'EQUALITY: ' + COALESCE(CAST(equality_columns_with_data_type AS NVARCHAR(MAX)), CAST(equality_columns AS NVARCHAR(MAX))) + N' '
+                         ELSE N'' END +
+
+                    CASE WHEN COALESCE(inequality_columns_with_data_type,inequality_columns) IS NOT NULL
+                                    THEN N'INEQUALITY: ' + COALESCE(CAST(inequality_columns_with_data_type AS NVARCHAR(MAX)), CAST(inequality_columns AS NVARCHAR(MAX))) + N' '
+                         ELSE N'' END +
+
+                    CASE WHEN COALESCE(included_columns_with_data_type,included_columns) IS NOT NULL
+                                    THEN N'INCLUDE: ' + COALESCE(CAST(included_columns_with_data_type AS NVARCHAR(MAX)), CAST(included_columns AS NVARCHAR(MAX))) + N' '
+                         ELSE N'' END,
+                [create_tsql] AS N'CREATE INDEX ['
+                    + LEFT(REPLACE(REPLACE(REPLACE(REPLACE(
+                        ISNULL(equality_columns,N'')+
+                        CASE WHEN equality_columns IS NOT NULL AND inequality_columns IS NOT NULL THEN N'_' ELSE N'' END
+                        + ISNULL(inequality_columns,''),',','')
+                        ,'[',''),']',''),' ','_')
+                    + CASE WHEN included_columns IS NOT NULL THEN N'_Includes' ELSE N'' END, 128) + N'] ON '
+                    + [statement] + N' (' + ISNULL(equality_columns,N'')
+                    + CASE WHEN equality_columns IS NOT NULL AND inequality_columns IS NOT NULL THEN N', ' ELSE N'' END
+                    + CASE WHEN inequality_columns IS NOT NULL THEN inequality_columns ELSE N'' END +
+                    ') ' + CASE WHEN included_columns IS NOT NULL THEN N' INCLUDE (' + included_columns + N')' ELSE N'' END
+                    + N' WITH ('
+                        + N'FILLFACTOR=100, ONLINE=ON, SORT_IN_TEMPDB=OFF'
+                    + N')'
+                    + N';'
+                    ,
+                [more_info] AS N'EXEC dbo.sp_Index @DatabaseName=' + QUOTENAME([database_name],'''') +
+                    N', @SchemaName=' + QUOTENAME([schema_name],'''') + N', @TableName=' + QUOTENAME([table_name],'''') + N';',
+                        [sample_query_plan] XML NULL
+            );
+
+
+
+
+        CREATE TABLE #ForeignKeys (
+                  [database_id] INT NOT NULL,
+            [database_name] NVARCHAR(128) NOT NULL ,
+                  [schema_name] NVARCHAR(128) NOT NULL ,
+            foreign_key_name NVARCHAR(256),
+            parent_object_id INT,
+            parent_object_name NVARCHAR(256),
+            referenced_object_id INT,
+            referenced_object_name NVARCHAR(256),
+            is_disabled BIT,
+            is_not_trusted BIT,
+            is_not_for_replication BIT,
+            parent_fk_columns NVARCHAR(MAX),
+            referenced_fk_columns NVARCHAR(MAX),
+            update_referential_action_desc NVARCHAR(16),
+            delete_referential_action_desc NVARCHAR(60)
+        );
+       
+        CREATE TABLE #IndexCreateTsql (
+            index_sanity_id INT NOT NULL,
+            create_tsql NVARCHAR(MAX) NOT NULL
+        );
+
+        CREATE TABLE #DatabaseList (
+                  DatabaseName NVARCHAR(256),
+            secondary_role_allow_connections_desc NVARCHAR(50)
+
+        );
+
+            CREATE TABLE #PartitionCompressionInfo (
+                  [index_sanity_id] INT NULL,
+                  [partition_compression_detail] NVARCHAR(4000) NULL
+        );
+
+            CREATE TABLE #Statistics (
+              database_id INT NOT NULL,
+              database_name NVARCHAR(256) NOT NULL,
+              table_name NVARCHAR(128) NULL,
+              schema_name NVARCHAR(128) NULL,
+              index_name  NVARCHAR(128) NULL,
+              column_names  NVARCHAR(MAX) NULL,
+              statistics_name NVARCHAR(128) NULL,
+              last_statistics_update DATETIME NULL,
+              days_since_last_stats_update INT NULL,
+              rows BIGINT NULL,
+              rows_sampled BIGINT NULL,
+              percent_sampled DECIMAL(18, 1) NULL,
+              histogram_steps INT NULL,
+              modification_counter BIGINT NULL,
+              percent_modifications DECIMAL(18, 1) NULL,
+              modifications_before_auto_update INT NULL,
+              index_type_desc NVARCHAR(128) NULL,
+              table_create_date DATETIME NULL,
+              table_modify_date DATETIME NULL,
+              no_recompute BIT NULL,
+              has_filter BIT NULL,
+              filter_definition NVARCHAR(MAX) NULL
+            );
+
+            CREATE TABLE #ComputedColumns
+            (
+              index_sanity_id INT IDENTITY(1, 1) NOT NULL,
+              database_name NVARCHAR(128) NULL,
+              database_id INT NOT NULL,
+              table_name NVARCHAR(128) NOT NULL,
+              schema_name NVARCHAR(128) NOT NULL,
+              column_name NVARCHAR(128) NULL,
+              is_nullable BIT NULL,
+              definition NVARCHAR(MAX) NULL,
+              uses_database_collation BIT NOT NULL,
+              is_persisted BIT NOT NULL,
+              is_computed BIT NOT NULL,
+              is_function INT NOT NULL,
+              column_definition NVARCHAR(MAX) NULL
+            );
+            
+            CREATE TABLE #TraceStatus
+            (
+             TraceFlag NVARCHAR(10) ,
+             status BIT ,
+             Global BIT ,
+             Session BIT
+            );
+
+        CREATE TABLE #TemporalTables
+        (
+            index_sanity_id INT IDENTITY(1, 1) NOT NULL,
+            database_name NVARCHAR(128) NOT NULL,
+            database_id INT NOT NULL,
+            schema_name NVARCHAR(128) NOT NULL,
+            table_name NVARCHAR(128) NOT NULL,
+            history_table_name NVARCHAR(128) NOT NULL,
+            history_schema_name NVARCHAR(128) NOT NULL,
+            start_column_name NVARCHAR(128) NOT NULL,
+            end_column_name NVARCHAR(128) NOT NULL,
+            period_name NVARCHAR(128) NOT NULL
+        );
+
+
+
+
+            CREATE TABLE #CheckConstraints
+            (
+              index_sanity_id INT IDENTITY(1, 1) NOT NULL,
+              database_name NVARCHAR(128) NULL,
+              database_id INT NOT NULL,
+              table_name NVARCHAR(128) NOT NULL,
+              schema_name NVARCHAR(128) NOT NULL,
+              constraint_name NVARCHAR(128) NULL,
+              is_disabled BIT NULL,
+              definition NVARCHAR(MAX) NULL,
+              uses_database_collation BIT NOT NULL,
+              is_not_trusted BIT NOT NULL,
+              is_function INT NOT NULL,
+              column_definition NVARCHAR(MAX) NULL
+            );
+
+            CREATE TABLE #FilteredIndexes
+            (
+              index_sanity_id INT IDENTITY(1, 1) NOT NULL,
+              database_name NVARCHAR(128) NULL,
+              database_id INT NOT NULL,
+              schema_name NVARCHAR(128) NOT NULL,
+              table_name NVARCHAR(128) NOT NULL,
+              index_name NVARCHAR(128) NULL,
+              column_name NVARCHAR(128) NULL
+            );
+
+        CREATE TABLE #Ignore_Databases
+        (
+          DatabaseName NVARCHAR(128),
+          Reason NVARCHAR(100)
+        );
+
+
+
+
+
+
+/* Sanitize our inputs */
+SELECT
+      @OutputServerName = QUOTENAME(@OutputServerName),
+      @OutputDatabaseName = QUOTENAME(@OutputDatabaseName),
+      @OutputSchemaName = QUOTENAME(@OutputSchemaName),
+      @OutputTableName = QUOTENAME(@OutputTableName);
+                              
+                              
+IF @GetAllDatabases = 1
+    BEGIN
+        INSERT INTO #DatabaseList (DatabaseName)
+        SELECT  DB_NAME(database_id)
+        FROM    sys.databases
+        WHERE user_access_desc = 'MULTI_USER'
+        AND state_desc = 'ONLINE'
+        AND database_id > 4
+        AND DB_NAME(database_id) NOT LIKE 'ReportServer%'
+        AND DB_NAME(database_id) NOT LIKE 'rdsadmin%'
+            AND LOWER(name) NOT IN('dbatools', 'dbadmin', 'dbmaintenance')
+        AND is_distributor = 0
+            OPTION    ( RECOMPILE );
+
+        /* Skip non-readable databases in an AG - see Github issue #1160 */
+        IF EXISTS (SELECT * FROM sys.all_objects o INNER JOIN sys.all_columns c ON o.object_id = c.object_id AND o.name = 'dm_hadr_availability_replica_states' AND c.name = 'role_desc')
+            BEGIN
+            SET @dsql = N'UPDATE #DatabaseList SET secondary_role_allow_connections_desc = ''NO'' WHERE DatabaseName IN (
+                        SELECT d.name
+                        FROM sys.dm_hadr_availability_replica_states rs
+                        INNER JOIN sys.databases d ON rs.replica_id = d.replica_id
+                        INNER JOIN sys.availability_replicas r ON rs.replica_id = r.replica_id
+                        WHERE rs.role_desc = ''SECONDARY''
+                        AND r.secondary_role_allow_connections_desc = ''NO'')
+                                    OPTION    ( RECOMPILE );';
+            EXEC sp_executesql @dsql;
+
+            IF EXISTS (SELECT * FROM #DatabaseList WHERE secondary_role_allow_connections_desc = 'NO')
+                BEGIN
+                INSERT    #IndexResults ( Priority, check_id, findings_group, finding, database_name, URL, details, index_definition,
+                                                index_usage_summary, index_size_summary )
+                VALUES  ( 1,
+                                  0,
+                              N'Skipped non-readable AG secondary databases.',
+                          N'You are running this on an AG secondary, and some of your databases are configured as non-readable when this is a secondary node.',
+                                  N'To analyze those databases, run sp_Index on the primary, or on a readable secondary.',
+                          '', '', '', '', ''
+                        );        
+                END;
+            END;
+
+        IF @IgnoreDatabases IS NOT NULL
+            AND LEN(@IgnoreDatabases) > 0
+            BEGIN
+                RAISERROR(N'Setting up filter to ignore databases', 0, 1) WITH NOWAIT;
+                SET @DatabaseToIgnore = '';
+
+                WHILE LEN(@IgnoreDatabases) > 0
+                BEGIN
+                    IF PATINDEX('%,%', @IgnoreDatabases) > 0
+                    BEGIN  
+                        SET @DatabaseToIgnore = SUBSTRING(@IgnoreDatabases, 0, PATINDEX('%,%',@IgnoreDatabases)) ;
+                       
+                        INSERT INTO #Ignore_Databases (DatabaseName, Reason)
+                        SELECT LTRIM(RTRIM(@DatabaseToIgnore)), 'Specified in the @IgnoreDatabases parameter'
+                        OPTION (RECOMPILE) ;
+                       
+                        SET @IgnoreDatabases = SUBSTRING(@IgnoreDatabases, LEN(@DatabaseToIgnore + ',') + 1, LEN(@IgnoreDatabases)) ;
+                    END;
+                    ELSE
+                    BEGIN
+                        SET @DatabaseToIgnore = @IgnoreDatabases ;
+                        SET @IgnoreDatabases = NULL ;
+
+                        INSERT INTO #Ignore_Databases (DatabaseName, Reason)
+                        SELECT LTRIM(RTRIM(@DatabaseToIgnore)), 'Specified in the @IgnoreDatabases parameter'
+                        OPTION (RECOMPILE) ;
+                    END;
+            END;
+               
+        END
+
+    END;
+ELSE
+    BEGIN
+        INSERT INTO #DatabaseList
+                ( DatabaseName )
+        SELECT CASE
+                        WHEN @DatabaseName IS NULL OR @DatabaseName = N''
+                        THEN DB_NAME()
+                    ELSE @DatabaseName END;
+               END;
+
+
+
+
+
+
+SET @NumDatabases = (SELECT COUNT(*) FROM #DatabaseList AS D LEFT OUTER JOIN #Ignore_Databases AS I ON D.DatabaseName = I.DatabaseName WHERE I.DatabaseName IS NULL);
+SET @msg = N'Number of databases to examine: ' + CAST(@NumDatabases AS NVARCHAR(50));
+RAISERROR (@msg,0,1) WITH NOWAIT;
+
+
+
+/* Running on 50+ databases can take a reaaallly long time, so we want explicit permission to do so (and only after warning about it) */
+
+
+BEGIN TRY
+        IF @NumDatabases >= 50 AND @BringThePain != 1 AND @TableName IS NULL
+        BEGIN
+
+            INSERT    #IndexResults ( Priority, check_id, findings_group, finding, URL, details, index_definition,
+                                            index_usage_summary, index_size_summary )
+            VALUES  ( -1,
+                            0 ,
+                          @ScriptVersionName,
+                      CASE WHEN @GetAllDatabases = 1 THEN N'All Databases' ELSE N'Database ' + QUOTENAME(@DatabaseName) + N' as of ' + CONVERT(NVARCHAR(16), GETDATE(), 121) END,
+                      N'From Your Community Volunteers',  
+                                N'',
+                      N'',
+                      N'',
+                                N''
+                    );
+            INSERT    #IndexResults ( Priority, check_id, findings_group, finding, database_name, URL, details, index_definition,
+                                            index_usage_summary, index_size_summary )
+            VALUES  ( 1,
+                            0,
+                          N'You''re trying to run sp_Index on a server with ' + CAST(@NumDatabases AS NVARCHAR(8)) + N' databases. ',
+                      N'Running sp_Index on a server with 50+ databases may cause temporary insanity for the server and/or user.',
+                              N'If you''re sure you want to do this, run again with the parameter @BringThePain = 1.',
+                      '',
+                                '',
+                                '',
+                                '',
+                                ''
+                    );        
+           
+                  if(@OutputType <> 'NONE')
+                  BEGIN
+                        SELECT bir._result_id,
+                                 bir.check_id,
+                                 bir.index_sanity_id,
+                                 bir.Priority,
+                                 bir.findings_group,
+                                 bir.finding,
+                                 bir.database_name,
+                                 bir.URL,
+                                 bir.details,
+                                 bir.index_definition,
+                                 bir.secret_columns,
+                                 bir.index_usage_summary,
+                                 bir.index_size_summary,
+                                 bir.create_tsql,
+                                 bir.more_info
+                                 FROM #IndexResults AS bir;
+                        RAISERROR('Running sp_Index on a server with 50+ databases may cause temporary insanity for the server', 12, 1);
+                  END;
+
+            RETURN;
+
+            END;
+END TRY
+BEGIN CATCH
+        RAISERROR (N'Failure to execute due to number of databases.', 0,1) WITH NOWAIT;
+
+        SELECT  @msg = ERROR_MESSAGE(),
+                      @ErrorSeverity = ERROR_SEVERITY(),
+                          @ErrorState = ERROR_STATE();
+
+        RAISERROR (@msg, @ErrorSeverity, @ErrorState);
+       
+        WHILE @@trancount > 0
